@@ -1,0 +1,18 @@
+{
+	"schemaVersion": 1,
+	"id": "ttmc",
+	"version": "${version}",
+	"name": "TTMC: Text To Minecraft",
+	"description": "Type a prompt, get a build. Runs a local model, offline.",
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": ["ttmc.TtmcMod"]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

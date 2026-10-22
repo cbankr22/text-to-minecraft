@@ -1,0 +1,14 @@
+# install torch first, for your CUDA version: https://pytorch.org/get-started/locally/
+numpy
+nbtlib
+trimesh
+pillow
+scipy
+pandas
+objaverse
+matplotlib
+pytest
+transformers
+huggingface_hub
+onnx
+onnxruntime

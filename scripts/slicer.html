@@ -1,0 +1,295 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build Slicer</title>
+<style>
+:root { --bg:#141518; --panel:#1d1f24; --fg:#e4e4e4; --mut:#9a9ca3; --line:#33363d;
+        --acc:#4fd18b; --warn:#f0b43c; --sel:#5ec8ff; --rej:#e05d5d; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:13px system-ui,sans-serif;
+       display:flex; height:100vh; overflow:hidden; }
+#wrap { flex:1; position:relative; }
+canvas { display:block; width:100%; height:100%; cursor:crosshair; }
+#side { width:360px; background:var(--panel); border-left:1px solid var(--line);
+        display:flex; flex-direction:column; overflow-y:auto; }
+.sec { padding:12px 14px; border-bottom:1px solid var(--line); }
+h1 { font-size:15px; margin:0 0 4px; } .mut { color:var(--mut); }
+#preview { width:100%; aspect-ratio:1; background:#e8e8e4; border-radius:4px; display:block;
+           image-rendering:auto; }
+#pvstate { position:absolute; margin:8px; color:#333; font-size:12px; }
+.tags { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; margin-top:8px; }
+.tags button, .row button { background:#2a2d34; color:var(--fg); border:1px solid var(--line);
+        border-radius:4px; padding:6px 4px; cursor:pointer; font:inherit; }
+.tags button.on { background:var(--acc); color:#06210f; border-color:var(--acc); font-weight:600; }
+.row { display:flex; gap:6px; align-items:center; margin-top:8px; }
+.row input { width:70px; background:#2a2d34; color:var(--fg); border:1px solid var(--line);
+             border-radius:4px; padding:5px; font:inherit; }
+kbd { background:#2a2d34; border:1px solid var(--line); border-radius:3px; padding:0 4px;
+      font-size:11px; }
+.keys div { margin:3px 0; }
+#status { font-size:12px; }
+</style></head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="side">
+  <div class="sec"><h1 id="title">Build Slicer</h1>
+    <div class="mut" id="counts"></div><div id="status" class="mut"></div></div>
+  <div class="sec">
+    <div id="selinfo" class="mut">Nothing selected. Press <kbd>N</kbd> to review the next suggestion,
+      or drag on the map to draw a box.</div>
+    <div style="position:relative;margin-top:8px"><span id="pvstate"></span><img id="preview" alt=""></div>
+    <div class="tags" id="tags"></div>
+    <div class="row">height <input id="y0" type="number"> to <input id="y1" type="number">
+      <button id="auto">auto</button></div>
+  </div>
+  <div class="sec keys mut">
+    <div><b style="color:var(--fg)">Review loop</b></div>
+    <div><kbd>N</kbd> next suggestion &middot; <kbd>1</kbd>-<kbd>9</kbd> accept + tag + next &middot;
+      <kbd>X</kbd> reject + next</div>
+    <div><b style="color:var(--fg)">Boxes</b></div>
+    <div>drag on empty map: draw a box &middot; drag a box: move &middot; drag its edge: resize</div>
+    <div><kbd>1</kbd>-<kbd>9</kbd> tag &middot; <kbd>Del</kbd>/<kbd>X</kbd> delete &middot;
+      <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo &middot; <kbd>Esc</kbd> deselect</div>
+    <div><b style="color:var(--fg)">View</b></div>
+    <div>scroll: zoom &middot; right-drag or <kbd>Space</kbd>+drag: pan &middot; <kbd>F</kbd> fit</div>
+    <div style="margin-top:6px">Yellow dashed = suggestion &middot; orange = untagged box &middot;
+      green = tagged box</div>
+  </div>
+</div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let meta, img = new Image(), state = {boxes: [], rejected: []};
+let view = {s: 1, tx: 0, ty: 0}, sel = null;   // sel: {kind:'box'|'sugg', i}
+let drag = null, spaceDown = false, undo = [];
+
+function px(wx) { return (wx - meta.ox) * view.s + view.tx; }
+function pz(wz) { return (wz - meta.oz) * view.s + view.ty; }
+function toWorld(sx, sy) { return [Math.floor((sx - view.tx) / view.s) + meta.ox,
+                                   Math.floor((sy - view.ty) / view.s) + meta.oz]; }
+
+async function init() {
+  meta = await (await fetch('/meta.json')).json();
+  const saved = meta.boxes;
+  if (Array.isArray(saved)) state.boxes = saved;           // older format
+  else if (saved && saved.boxes) state = saved;
+  state.rejected = state.rejected || [];
+  document.getElementById('title').textContent = 'Build Slicer: ' + meta.world;
+  const tg = document.getElementById('tags');
+  meta.tags.forEach((t, i) => {
+    const b = document.createElement('button'); b.textContent = (i + 1) + ' ' + t;
+    b.onclick = () => tagSel(i); tg.appendChild(b);
+  });
+  img.onload = () => { fit(); draw(); };
+  img.src = '/map.png';
+  updateSide();
+}
+
+function resize() { cv.width = cv.clientWidth * devicePixelRatio; cv.height = cv.clientHeight * devicePixelRatio;
+                    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); draw(); }
+function fit() {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  view.s = Math.min(w / meta.width, h / meta.height);
+  view.tx = (w - meta.width * view.s) / 2; view.ty = (h - meta.height * view.s) / 2;
+}
+function usedSugg() { return new Set(state.boxes.filter(b => b.sugg != null).map(b => b.sugg)); }
+function pending() { const used = usedSugg(), rej = new Set(state.rejected);
+  return meta.suggestions.map((s, i) => i).filter(i => !used.has(i) && !rej.has(i)); }
+
+function draw() {
+  if (!meta) return;
+  ctx.fillStyle = '#0d0e10'; ctx.fillRect(0, 0, cv.clientWidth, cv.clientHeight);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, view.tx, view.ty, meta.width * view.s, meta.height * view.s);
+  const rect = (b) => [px(b.x0), pz(b.z0), (b.x1 - b.x0) * view.s, (b.z1 - b.z0) * view.s];
+  ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+  for (const i of pending()) {
+    const isSel = sel && sel.kind === 'sugg' && sel.i === i;
+    ctx.strokeStyle = isSel ? '#5ec8ff' : '#f0d43c'; ctx.lineWidth = isSel ? 3 : 1.5;
+    ctx.strokeRect(...rect(meta.suggestions[i]));
+  }
+  ctx.setLineDash([]);
+  state.boxes.forEach((b, i) => {
+    const isSel = sel && sel.kind === 'box' && sel.i === i;
+    ctx.lineWidth = isSel ? 3 : 2;
+    ctx.strokeStyle = isSel ? '#5ec8ff' : (b.tag == null ? '#f0903c' : '#4fd18b');
+    const r = rect(b); ctx.strokeRect(...r);
+    if (b.tag != null && view.s > 1.2) {
+      ctx.font = '11px system-ui'; ctx.fillStyle = 'rgba(0,0,0,.65)';
+      const t = meta.tags[b.tag]; ctx.fillRect(r[0], r[1] - 14, ctx.measureText(t).width + 6, 14);
+      ctx.fillStyle = '#fff'; ctx.fillText(t, r[0] + 3, r[1] - 3);
+    }
+  });
+  if (drag && drag.mode === 'draw') {
+    ctx.strokeStyle = '#5ec8ff'; ctx.lineWidth = 2; ctx.setLineDash([3, 3]);
+    const b = normBox(drag.a, drag.b);
+    ctx.strokeRect(px(b.x0), pz(b.z0), (b.x1 - b.x0) * view.s, (b.z1 - b.z0) * view.s);
+    ctx.setLineDash([]);
+  }
+}
+
+function normBox(a, b) { return {x0: Math.min(a[0], b[0]), z0: Math.min(a[1], b[1]),
+                                 x1: Math.max(a[0], b[0]) + 1, z1: Math.max(a[1], b[1]) + 1}; }
+function inside(b, w) { return w[0] >= b.x0 && w[0] < b.x1 && w[1] >= b.z0 && w[1] < b.z1; }
+function edgeAt(b, sx, sy) {   // which edges of box b are under the cursor (screen px)
+  const t = 6, e = {};
+  const L = px(b.x0), R = px(b.x1), T = pz(b.z0), B = pz(b.z1);
+  if (sy > T - t && sy < B + t) { if (Math.abs(sx - L) < t) e.x0 = 1; else if (Math.abs(sx - R) < t) e.x1 = 1; }
+  if (sx > L - t && sx < R + t) { if (Math.abs(sy - T) < t) e.z0 = 1; else if (Math.abs(sy - B) < t) e.z1 = 1; }
+  return Object.keys(e).length ? e : null;
+}
+
+function snapshot() { undo.push(JSON.stringify(state)); if (undo.length > 100) undo.shift(); }
+let saveTimer = null;
+function changed() {
+  draw(); updateSide();
+  document.getElementById('status').textContent = 'saving...';
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    const r = await fetch('/save', {method: 'POST', body: JSON.stringify(state)});
+    document.getElementById('status').textContent = r.ok ? 'saved' : 'SAVE FAILED';
+  }, 600);
+}
+
+function selected() {
+  if (!sel) return null;
+  return sel.kind === 'box' ? state.boxes[sel.i] : meta.suggestions[sel.i];
+}
+function updateSide() {
+  const p = pending().length, tagged = state.boxes.filter(b => b.tag != null).length;
+  document.getElementById('counts').textContent =
+    `${state.boxes.length} boxes (${tagged} tagged) · ${p} suggestions left · ${state.rejected.length} rejected`;
+  const b = selected(), info = document.getElementById('selinfo');
+  document.querySelectorAll('#tags button').forEach((el, i) =>
+    el.classList.toggle('on', !!(b && sel.kind === 'box' && b.tag === i)));
+  if (!b) { info.innerHTML = 'Nothing selected. Press <kbd>N</kbd> to review the next suggestion, or drag on the map to draw a box.';
+            document.getElementById('preview').removeAttribute('src'); return; }
+  info.textContent = `${sel.kind === 'box' ? 'box' : 'suggestion'} · ${b.x1 - b.x0} × ${b.z1 - b.z0} blocks` +
+    (b.y0 != null ? ` · y ${b.y0}..${b.y1}` : '') + ` · at ${b.x0}, ${b.z0}`;
+  document.getElementById('y0').value = b.y0 ?? ''; document.getElementById('y1').value = b.y1 ?? '';
+  schedulePreview();
+}
+
+let pvTimer = null, pvSeq = 0;
+function schedulePreview() {
+  clearTimeout(pvTimer);
+  pvTimer = setTimeout(async () => {
+    const b = selected(); if (!b) return;
+    const seq = ++pvSeq;
+    if (b.y0 == null && sel.kind === 'box') {
+      const y = await (await fetch(`/auto_y?x0=${b.x0}&z0=${b.z0}&x1=${b.x1}&z1=${b.z1}`)).json();
+      b.y0 = y.y0; b.y1 = y.y1; changed(); return;
+    }
+    let q = `x0=${b.x0}&z0=${b.z0}&x1=${b.x1}&z1=${b.z1}`;
+    if (b.y0 != null) q += `&y0=${b.y0}&y1=${b.y1}`;
+    document.getElementById('pvstate').textContent = 'rendering...';
+    const r = await fetch('/preview?' + q);
+    if (seq !== pvSeq) return;
+    if (r.ok) document.getElementById('preview').src = URL.createObjectURL(await r.blob());
+    document.getElementById('pvstate').textContent = r.ok ? '' : 'preview failed';
+  }, 250);
+}
+
+function center(b) {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const s = Math.min(w / ((b.x1 - b.x0) * 5), h / ((b.z1 - b.z0) * 5), 12);
+  view.s = Math.max(s, 1.5);
+  view.tx = w / 2 - ((b.x0 + b.x1) / 2 - meta.ox) * view.s;
+  view.ty = h / 2 - ((b.z0 + b.z1) / 2 - meta.oz) * view.s;
+}
+function nextSugg() {
+  const p = pending(); if (!p.length) { sel = null; updateSide(); draw(); return; }
+  sel = {kind: 'sugg', i: p[0]}; center(meta.suggestions[p[0]]); draw(); updateSide();
+}
+function tagSel(t) {
+  if (!sel) return;
+  snapshot();
+  if (sel.kind === 'sugg') {
+    const s = meta.suggestions[sel.i];
+    state.boxes.push({x0: s.x0, z0: s.z0, x1: s.x1, z1: s.z1, tag: t, sugg: sel.i});
+    changed(); nextSugg(); return;
+  }
+  state.boxes[sel.i].tag = t; changed();
+}
+function deleteSel() {
+  if (!sel) return;
+  snapshot();
+  if (sel.kind === 'sugg') { state.rejected.push(sel.i); changed(); nextSugg(); return; }
+  state.boxes.splice(sel.i, 1); sel = null; changed();
+}
+
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const f = Math.exp(-e.deltaY * 0.0015), mx = e.offsetX, my = e.offsetY;
+  view.tx = mx - (mx - view.tx) * f; view.ty = my - (my - view.ty) * f; view.s *= f; draw();
+}, {passive: false});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('mousedown', e => {
+  const sx = e.offsetX, sy = e.offsetY, w = toWorld(sx, sy);
+  if (e.button !== 0 || spaceDown) { drag = {mode: 'pan', sx, sy, tx: view.tx, ty: view.ty}; return; }
+  if (sel && sel.kind === 'box') {
+    const ed = edgeAt(state.boxes[sel.i], sx, sy);
+    if (ed) { snapshot(); drag = {mode: 'resize', edges: ed}; return; }
+  }
+  for (let i = state.boxes.length - 1; i >= 0; i--) {
+    if (inside(state.boxes[i], w)) {
+      sel = {kind: 'box', i}; snapshot();
+      drag = {mode: 'move', w, orig: {...state.boxes[i]}}; draw(); updateSide(); return;
+    }
+  }
+  for (const i of pending()) {
+    if (inside(meta.suggestions[i], w)) { sel = {kind: 'sugg', i}; draw(); updateSide(); return; }
+  }
+  drag = {mode: 'draw', a: w, b: w};
+});
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  const r = cv.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top, w = toWorld(sx, sy);
+  if (drag.mode === 'pan') { view.tx = drag.tx + sx - drag.sx; view.ty = drag.ty + sy - drag.sy; }
+  else if (drag.mode === 'draw') drag.b = w;
+  else if (drag.mode === 'move') {
+    const b = state.boxes[sel.i], dx = w[0] - drag.w[0], dz = w[1] - drag.w[1];
+    b.x0 = drag.orig.x0 + dx; b.x1 = drag.orig.x1 + dx; b.z0 = drag.orig.z0 + dz; b.z1 = drag.orig.z1 + dz;
+    drag.moved = drag.moved || dx || dz;
+  } else if (drag.mode === 'resize') {
+    const b = state.boxes[sel.i], e2 = drag.edges;
+    if (e2.x0) b.x0 = Math.min(w[0], b.x1 - 1); if (e2.x1) b.x1 = Math.max(w[0] + 1, b.x0 + 1);
+    if (e2.z0) b.z0 = Math.min(w[1], b.z1 - 1); if (e2.z1) b.z1 = Math.max(w[1] + 1, b.z0 + 1);
+  }
+  draw();
+});
+window.addEventListener('mouseup', () => {
+  if (!drag) return;
+  const d = drag; drag = null;
+  if (d.mode === 'draw') {
+    const b = normBox(d.a, d.b);
+    if (b.x1 - b.x0 >= 3 && b.z1 - b.z0 >= 3) {
+      snapshot(); state.boxes.push({...b, tag: null}); sel = {kind: 'box', i: state.boxes.length - 1}; changed();
+    } else { sel = null; draw(); updateSide(); }
+  } else if (d.mode === 'resize' || (d.mode === 'move' && d.moved)) {
+    const b = state.boxes[sel.i]; b.y0 = null; b.y1 = null; changed();   // re-derive height
+  } else if (d.mode === 'move') undo.pop();
+});
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'Space') { spaceDown = true; e.preventDefault(); }
+  const k = e.key.toLowerCase();
+  if (e.ctrlKey && k === 'z') { if (undo.length) { state = JSON.parse(undo.pop()); sel = null; changed(); } return; }
+  if (k >= '1' && k <= '9') tagSel(+k - 1);
+  else if (k === 'n') nextSugg();
+  else if (k === 'x' || k === 'delete' || k === 'backspace') deleteSel();
+  else if (k === 'escape') { sel = null; draw(); updateSide(); }
+  else if (k === 'f') { fit(); draw(); }
+});
+window.addEventListener('keyup', e => { if (e.code === 'Space') spaceDown = false; });
+for (const id of ['y0', 'y1']) document.getElementById(id).addEventListener('change', () => {
+  if (!sel || sel.kind !== 'box') return;
+  snapshot(); const b = state.boxes[sel.i];
+  b.y0 = +document.getElementById('y0').value; b.y1 = +document.getElementById('y1').value; changed();
+});
+document.getElementById('auto').onclick = () => {
+  if (!sel || sel.kind !== 'box') return; snapshot();
+  const b = state.boxes[sel.i]; b.y0 = null; b.y1 = null; changed();
+};
+window.addEventListener('resize', resize);
+resize(); init();
+</script>
+</body></html>

@@ -1,0 +1,34 @@
+# secrets: never commit
+*token*.txt
+*Key*.txt
+*key*.txt
+.env
+
+# data, checkpoints, exported models (weights are published as release files / on Hugging Face)
+data/
+*.pt
+*.onnx
+*.npy
+*.zip
+
+# tools and environments
+.venv/
+tools/
+__pycache__/
+*.pyc
+.claude/
+
+# mod build output and dev client
+mod/build/
+mod/run/
+mod/.gradle/
+mod/bin/
+.gradle/
+
+# local notes and scratch images
+CLAUDE.md
+MESSAGE_TO_OPUS.md
+MORNING.md
+CLOUD_PLAN.md
+MODEL_AUDIT_*.md
+/*.png
